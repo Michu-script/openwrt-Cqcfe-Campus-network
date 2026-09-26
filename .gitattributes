@@ -1,0 +1,12 @@
+# 文本文件统一使用 LF 行尾，避免在 Windows 检出时引入 CRLF
+*.md text eol=lf
+
+# OpenWrt 包内的脚本与配置必须使用 LF 行尾，否则在路由器上会因 \r 无法执行
+package/luci-app-campus-portal/** text eol=lf
+
+# 二进制文件不做换行转换
+*.ipk binary
+*.gz binary
+
+# 校验文件保持 LF，避免 sha256sum -c 因 \r 校验失败
+*.sha256 text eol=lf
