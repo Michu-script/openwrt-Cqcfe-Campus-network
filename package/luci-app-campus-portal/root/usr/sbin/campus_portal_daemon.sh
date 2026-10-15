@@ -49,6 +49,20 @@ MAX_RETRY="10"
 RETRY_COOLDOWN="1800"
 BACKOFF_MAX="300"
 
+AUTO_RECOVER=1
+RECOVER_AFTER="6"
+RECOVER_COOLDOWN="120"
+RECOVER_WAIT="8"
+RECOVER_IFACE=""
+
+PORTAL_STATE="unknown"
+LAST_FAIL_REASON=""
+PORTAL_UNREACH_COUNT=0
+RECOVER_COUNT=0
+RECOVER_LEVEL=0
+LAST_RECOVER_TIME=0
+UPLINK_IFACE=""
+
 LOGIN_STATE="unknown"
 INTERNET_CHECK="unknown"
 LAST_CHECK_HTTP="ping_unknown"
@@ -444,6 +458,12 @@ write_state() {
 	json_add_string silent_state "$SILENT_STATE"
 	json_add_string fail_count "$FAIL_COUNT"
 	json_add_string next_sleep "$NEXT_SLEEP"
+	json_add_string portal_state "$PORTAL_STATE"
+	json_add_string last_fail_reason "$LAST_FAIL_REASON"
+	json_add_string unreach_count "$PORTAL_UNREACH_COUNT"
+	json_add_string recover_count "$RECOVER_COUNT"
+	json_add_string recover_level "$RECOVER_LEVEL"
+	json_add_string uplink_iface "$UPLINK_IFACE"
 	json_dump >"$STATE_TMP"
 	mv "$STATE_TMP" "$STATE_FILE"
 }
@@ -485,6 +505,12 @@ load_cfg() {
 	config_get RETRY_COOLDOWN main retry_cooldown "1800"
 	config_get BACKOFF_MAX main backoff_max "300"
 
+	config_get_bool AUTO_RECOVER main auto_recover 1
+	config_get RECOVER_AFTER main recover_after "6"
+	config_get RECOVER_COOLDOWN main recover_cooldown "120"
+	config_get RECOVER_WAIT main recover_wait "8"
+	config_get RECOVER_IFACE main recover_iface ""
+
 	GATEWAY="${GATEWAY%/}"
 	LOGIN_API_PATH="$(normalize_api_path "$LOGIN_API_PATH")"
 	ONLINE_API_PATH="$(normalize_api_path "$ONLINE_API_PATH")"
@@ -494,6 +520,9 @@ load_cfg() {
 	MAX_RETRY="$(sanitize_int "$MAX_RETRY" 10)"
 	RETRY_COOLDOWN="$(sanitize_int "$RETRY_COOLDOWN" 1800)"
 	BACKOFF_MAX="$(sanitize_int "$BACKOFF_MAX" 300)"
+	RECOVER_AFTER="$(sanitize_int "$RECOVER_AFTER" 6)"
+	RECOVER_COOLDOWN="$(sanitize_int "$RECOVER_COOLDOWN" 120)"
+	RECOVER_WAIT="$(sanitize_int "$RECOVER_WAIT" 8)"
 	LAST_CHECK_TARGET="$(extract_ping_target)"
 
 	CLIENT_MAC="$(printf '%s' "$CLIENT_MAC" | tr '[:lower:]' '[:upper:]' | tr -d ':-')"
@@ -502,6 +531,138 @@ load_cfg() {
 	refresh_client_identity
 	refresh_day_type
 
+	return 0
+}
+
+default_gateway() {
+	ip route 2>/dev/null | awk '/^default/ { print $3; exit }'
+}
+
+classify_connectivity_failure() {
+	local detail="$1"
+	local gw=""
+
+	gw="$(default_gateway)"
+
+	if [ -n "$gw" ] && ping -c 1 -W "$CHECK_TIMEOUT" "$gw" >/dev/null 2>&1; then
+		printf 'upstream'
+		return 0
+	fi
+
+	case "$detail" in
+	*bad\ address*) printf 'dns' ;;
+	*[Uu]nreachable*) printf 'route' ;;
+	*) printf 'gateway' ;;
+	esac
+}
+
+resolve_uplink_iface() {
+	local name=""
+	local status=""
+	local l3=""
+	local dev=""
+
+	if [ -n "$RECOVER_IFACE" ]; then
+		printf '%s' "$RECOVER_IFACE"
+		return 0
+	fi
+
+	command -v ubus >/dev/null 2>&1 || return 0
+
+	if [ -n "$DETECTED_IFACE" ]; then
+		for name in $(ubus list 2>/dev/null | grep '^network\.interface\.'); do
+			status="$(ubus call "$name" status 2>/dev/null)" || continue
+			json_load "$status" 2>/dev/null
+			json_get_var l3 l3_device
+			json_get_var dev device
+			if [ "$l3" = "$DETECTED_IFACE" ] || [ "$dev" = "$DETECTED_IFACE" ]; then
+				printf '%s' "${name#network.interface.}"
+				return 0
+			fi
+		done
+	fi
+
+	for name in wwan wan; do
+		status="$(ubus call "network.interface.$name" status 2>/dev/null)" || continue
+		case "$status" in
+		*'"up": true'*|*'"up":true'*) printf '%s' "$name"; return 0 ;;
+		esac
+	done
+
+	for name in $(ubus list 2>/dev/null | grep '^network\.interface\.'); do
+		status="$(ubus call "$name" status 2>/dev/null)" || continue
+		case "$status" in
+		*'"up": true'*|*'"up":true'*) printf '%s' "${name#network.interface.}"; return 0 ;;
+		esac
+	done
+
+	return 0
+}
+
+recover_allowed() {
+	local now=""
+
+	[ "$RECOVER_COOLDOWN" -gt 0 ] || return 0
+
+	now="$(date +%s)"
+	if [ "$LAST_RECOVER_TIME" -gt 0 ] && [ $((now - LAST_RECOVER_TIME)) -lt "$RECOVER_COOLDOWN" ]; then
+		return 1
+	fi
+
+	return 0
+}
+
+recover_link() {
+	local iface=""
+
+	RECOVER_LEVEL=$((RECOVER_LEVEL + 1))
+	[ "$RECOVER_LEVEL" -gt 4 ] && RECOVER_LEVEL=1
+
+	iface="$(resolve_uplink_iface)"
+	UPLINK_IFACE="$iface"
+
+	LAST_RECOVER_TIME="$(date +%s)"
+	RECOVER_COUNT=$((RECOVER_COUNT + 1))
+	LAST_ACTION="link_recover"
+	LAST_ACTION_TIME="$(now_human)"
+
+	case "$RECOVER_LEVEL" in
+	1)
+		LAST_MESSAGE="link_recover_renew"
+		log "self-heal level 1: ubus renew ${iface:-unknown}"
+		if [ -n "$iface" ]; then
+			ubus call "network.interface.$iface" renew >/dev/null 2>&1
+		fi
+		;;
+	2)
+		LAST_MESSAGE="link_recover_ifup"
+		log "self-heal level 2: ifup ${iface:-unknown}"
+		if [ -n "$iface" ]; then
+			ifup "$iface" >/dev/null 2>&1
+		fi
+		;;
+	3)
+		LAST_MESSAGE="link_recover_restart"
+		log "self-heal level 3: ifdown+ifup ${iface:-unknown}"
+		if [ -n "$iface" ]; then
+			ifdown "$iface" >/dev/null 2>&1
+			sleep 2
+			ifup "$iface" >/dev/null 2>&1
+		fi
+		;;
+	*)
+		LAST_MESSAGE="link_recover_wifi"
+		log "self-heal level 4: wifi reload"
+		if command -v wifi >/dev/null 2>&1; then
+			wifi reload >/dev/null 2>&1
+		fi
+		if [ -n "$iface" ]; then
+			ifup "$iface" >/dev/null 2>&1
+		fi
+		;;
+	esac
+
+	sleep "$RECOVER_WAIT"
 	return 0
 }
 
@@ -531,15 +692,18 @@ check_portal_online() {
 	local ipv664
 	local response
 	local json
+	local rc=0
 
-	[ -n "$CLIENT_IP" ] || return 1
+	PORTAL_STATE="unknown"
+
+	[ -n "$CLIENT_IP" ] || return 2
 
 	callback="dr$(date +%s)$$"
 	api="$(join_url "$GATEWAY" "$ONLINE_API_PATH")"
 	ip64="$(printf '%s' "$CLIENT_IP" | base64 | tr -d '\r\n')"
 	ipv664="$(printf '%s' "$CLIENT_IPV6" | base64 | tr -d '\r\n')"
 
-	response="$(curl -L -s --get \
+	response="$(curl -4 -L -s --get \
 		--connect-timeout "$CHECK_TIMEOUT" \
 		--max-time "$CHECK_TIMEOUT" \
 		"$api" \
@@ -551,11 +715,21 @@ check_portal_online() {
 		--data-urlencode "wlan_user_ipv6=$ipv664" \
 		--data-urlencode "jsVersion=$JS_VERSION" \
 		--data-urlencode "v=$(date +%s)" 2>/dev/null)"
+	rc=$?
 
-	[ -z "$response" ] && return 1
+	if [ "$rc" -ne 0 ] || [ -z "$response" ]; then
+		PORTAL_STATE="unreachable"
+		return 2
+	fi
 
 	json="$(extract_jsonp "$response")"
-	is_online_json "$json"
+	if is_online_json "$json"; then
+		PORTAL_STATE="online"
+		return 0
+	fi
+
+	PORTAL_STATE="offline"
+	return 1
 }
 
 do_portal_login() {
@@ -572,7 +746,7 @@ do_portal_login() {
 	referer="$(extract_host_root)"
 	[ -z "$referer" ] && referer="$GATEWAY/"
 
-	response="$(curl -L -s --get \
+	response="$(curl -4 -L -s --get \
 		--connect-timeout "$CHECK_TIMEOUT" \
 		--max-time "$CHECK_TIMEOUT" \
 		"$api" \
@@ -610,6 +784,8 @@ handle_exit() {
 }
 
 run_once() {
+	local portal_rc=0
+
 	NEXT_SLEEP="$CHECK_INTERVAL"
 
 	if ! load_cfg; then
@@ -654,6 +830,10 @@ run_once() {
 
 	if check_connectivity; then
 		FAIL_COUNT=0
+		PORTAL_UNREACH_COUNT=0
+		RECOVER_LEVEL=0
+		PORTAL_STATE="ok"
+		LAST_FAIL_REASON=""
 		LOGIN_STATE="online"
 		INTERNET_CHECK="ok"
 		LAST_ACTION="none"
@@ -678,13 +858,57 @@ run_once() {
 		return
 	fi
 
-	if check_portal_online; then
+	check_portal_online
+	portal_rc=$?
+
+	if [ "$portal_rc" -eq 0 ]; then
 		FAIL_COUNT=0
+		PORTAL_UNREACH_COUNT=0
+		RECOVER_LEVEL=0
+		LAST_FAIL_REASON=""
 		LOGIN_STATE="online"
 		LAST_ACTION="none"
 		LAST_ACTION_TIME="$LAST_CHECK_TIME"
 		LAST_MESSAGE="bing_failed_but_portal_online"
 		log "portal online while ping failed"
+		write_state
+		NEXT_SLEEP="$CHECK_INTERVAL"
+		return
+	fi
+
+	if [ "$portal_rc" -eq 2 ]; then
+		LAST_FAIL_REASON="$(classify_connectivity_failure "$LAST_CHECK_DETAIL")"
+		PORTAL_UNREACH_COUNT=$((PORTAL_UNREACH_COUNT + 1))
+		LOGIN_STATE="offline"
+		log "portal unreachable (count=$PORTAL_UNREACH_COUNT reason=$LAST_FAIL_REASON)"
+
+		if [ "$AUTO_RECOVER" -eq 1 ] && [ "$PORTAL_UNREACH_COUNT" -ge "$RECOVER_AFTER" ] && recover_allowed; then
+			recover_link
+			if check_connectivity; then
+				FAIL_COUNT=0
+				PORTAL_UNREACH_COUNT=0
+				RECOVER_LEVEL=0
+				PORTAL_STATE="ok"
+				LAST_FAIL_REASON=""
+				LOGIN_STATE="online"
+				INTERNET_CHECK="ok"
+				LAST_ACTION="link_recovered"
+				LAST_ACTION_TIME="$(now_human)"
+				LAST_MESSAGE="link_recovered_after_self_heal"
+				log "link recovered after self-heal"
+				write_state
+				NEXT_SLEEP="$CHECK_INTERVAL"
+				return
+			fi
+
+			LAST_MESSAGE="link_recover_failed"
+			log "self-heal attempted but link still down"
+		else
+			LAST_ACTION="wait_link"
+			LAST_ACTION_TIME="$LAST_CHECK_TIME"
+			LAST_MESSAGE="portal_unreachable_wait_recover"
+		fi
+
 		write_state
 		NEXT_SLEEP="$CHECK_INTERVAL"
 		return
@@ -716,6 +940,9 @@ run_once() {
 			record_success_login
 			log "portal login verified online"
 			FAIL_COUNT=0
+			PORTAL_UNREACH_COUNT=0
+			RECOVER_LEVEL=0
+			LAST_FAIL_REASON=""
 			write_state
 			NEXT_SLEEP="$CHECK_INTERVAL"
 			return

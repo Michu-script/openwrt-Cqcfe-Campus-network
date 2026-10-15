@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-campus-portal
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=Campus Portal Maintainer
@@ -16,13 +16,15 @@ define Package/luci-app-campus-portal
   SUBMENU:=3. Applications
   TITLE:=Campus portal auto login
   PKGARCH:=all
-  DEPENDS:=+luci-base +luci-compat +curl +coreutils-base64 +libubox
+  DEPENDS:=+luci-base +luci-compat +curl +coreutils-base64 +libubox +ubus
 endef
 
 define Package/luci-app-campus-portal/description
  LuCI page + daemon for campus portal keep-alive and auto login.
  The daemon checks cn.bing.com every 5 seconds. If failed, it checks
  portal online state and triggers portal login when offline.
+ When the portal stays unreachable (suspected uplink loss), it also
+ performs graded link self-heal (renew / ifup / ifdown+ifup / wifi reload).
 endef
 
 define Build/Compile

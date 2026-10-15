@@ -28,9 +28,11 @@ Typical characteristics:
 
 1. The daemon runs `ping cn.bing.com` every 5 seconds.
 2. If ping succeeds, the plugin treats the network as reachable.
-3. If ping fails, it calls `/eportal/portal/online_list` to verify portal login state.
-4. If portal state is offline, it calls `/eportal/portal/login`.
-5. After login, it verifies the result again using the online-state API.
+3. If ping fails, it calls `/eportal/portal/online_list` to verify portal login state (requests force IPv4).
+4. Portal reachability is tri-state: `online` / reachable-but-offline / `unreachable`.
+5. If portal state is offline, it calls `/eportal/portal/login`.
+6. After login, it verifies the result again using the online-state API.
+7. If the portal is `unreachable`, the failure is classified (gateway / route / dns / upstream). After `recover_after` consecutive unreachable results the daemon triggers a graded link self-heal: `ubus renew` → `ifup` → `ifdown+ifup` → `wifi reload`, throttled by `recover_cooldown`.
 
 This avoids false positives caused by HTTP cache and avoids repeated blind login attempts.
 
@@ -45,8 +47,8 @@ This avoids false positives caused by HTTP cache and avoids repeated blind login
 ## Runtime logic
 
 1. Daemon checks `cn.bing.com` every 5 seconds using `ping`.
-2. If connectivity check fails, it queries portal online state.
-3. If not online, it triggers portal login.
+2. If connectivity check fails, it queries portal online state (tri-state).
+3. If reachable but not online, it triggers portal login; if unreachable, it classifies the failure reason and, after `recover_after` consecutive failures, runs a graded link self-heal (`renew` → `ifup` → `ifdown+ifup` → `wifi reload`).
 4. During workday silent hours (default `00:00-05:00`) it skips all checks; holidays and rest days are never silent.
 5. Consecutive login failures use progressive backoff, and reaching the retry cap enters a longer cooldown.
 6. Each successful login is appended to a local history log and only the latest 5 records are kept.
@@ -55,8 +57,20 @@ This avoids false positives caused by HTTP cache and avoids repeated blind login
    - current login state
    - last internet check result
    - last action, time, and message
+   - portal reachability (`portal_state`) and last failure reason (`last_fail_reason`)
+   - self-heal counters (`unreach_count`, `recover_count`, `recover_level`, `uplink_iface`)
    - last 5 successful login records
    - recent operation logs
+
+## Self-heal options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `auto_recover` | `1` | Enable graded link self-heal when the portal stays unreachable |
+| `recover_after` | `6` | Consecutive unreachable results before triggering one self-heal |
+| `recover_cooldown` | `120` | Minimum seconds between two self-heal actions |
+| `recover_wait` | `8` | Seconds to wait for the link to come back after a self-heal action |
+| `recover_iface` | empty | Logical interface (e.g. `wwan`) to `renew`/`ifup`; auto-detected when empty |
 
 ## Layout
 
@@ -84,12 +98,12 @@ make package/luci-app-campus-portal/compile V=s
 
 Output artifact example:
 
-- `bin/packages/*/base/luci-app-campus-portal_1.0.0-1_all.ipk`
+- `bin/packages/*/base/luci-app-campus-portal_1.0.0-2_all.ipk`
 
 ## Post-install
 
 ```sh
-opkg install luci-app-campus-portal_1.0.0-1_all.ipk
+opkg install luci-app-campus-portal_1.0.0-2_all.ipk
 /etc/init.d/campus_portal enable
 /etc/init.d/campus_portal start
 ```

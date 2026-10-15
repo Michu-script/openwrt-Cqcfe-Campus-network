@@ -155,6 +155,34 @@ local function map_silent_state(value)
 	return "未知"
 end
 
+local function map_portal_state(value)
+	if value == "ok" then
+		return "联网正常"
+	elseif value == "online" then
+		return "门户在线"
+	elseif value == "offline" then
+		return "门户可达未登录"
+	elseif value == "unreachable" then
+		return "门户不可达"
+	end
+
+	return "未知"
+end
+
+local function map_fail_reason(value)
+	if value == "dns" then
+		return "DNS 解析失败"
+	elseif value == "route" then
+		return "路由不可达"
+	elseif value == "gateway" then
+		return "网关不可达"
+	elseif value == "upstream" then
+		return "上游/认证问题"
+	end
+
+	return "-"
+end
+
 local state = read_state()
 local detect = read_detect()
 local history = read_history()
@@ -204,6 +232,25 @@ function fail_count.cfgvalue()
 	local count = state.fail_count or "0"
 	local next_sleep = state.next_sleep or "-"
 	return string.format("连续失败: %s 次, 下次检测等待: %s 秒", count, next_sleep)
+end
+
+portal_state = s:option(DummyValue, "_portal_state", "门户可达性")
+function portal_state.cfgvalue()
+	return map_portal_state(state.portal_state)
+end
+
+fail_reason = s:option(DummyValue, "_fail_reason", "最近失败原因")
+function fail_reason.cfgvalue()
+	return map_fail_reason(state.last_fail_reason)
+end
+
+recover_info = s:option(DummyValue, "_recover_info", "链路自愈")
+function recover_info.cfgvalue()
+	local unreach = state.unreach_count or "0"
+	local count = state.recover_count or "0"
+	local level = state.recover_level or "0"
+	local iface = first_nonempty(state.uplink_iface, state.detected_iface, "-")
+	return string.format("连续不可达: %s 次, 已自愈: %s 次, 下次级别: %s, 自愈接口: %s", unreach, count, level, iface)
 end
 
 detected_iface = s:option(DummyValue, "_detected_iface", "自动识别接口")
@@ -381,6 +428,34 @@ backoff_max.datatype = "uinteger"
 backoff_max.default = "300"
 backoff_max.rmempty = false
 backoff_max.description = "渐进退避序列为 首次间隔→15→30→60→120→该值，登录成功后立即重置。"
+
+auto_recover = s:option(Flag, "auto_recover", "启用链路自愈")
+auto_recover.default = "1"
+auto_recover.rmempty = false
+auto_recover.description = "当门户持续不可达（疑似上行链路掉线）时，自动按级别重连上行网络，避免必须重启路由器才能恢复。"
+
+recover_after = s:option(Value, "recover_after", "自愈触发阈值(次)")
+recover_after.datatype = "uinteger"
+recover_after.default = "6"
+recover_after.rmempty = false
+recover_after.description = "连续检测到门户不可达达到该次数后触发一次自愈。按默认 5 秒检测间隔约 30 秒。"
+
+recover_cooldown = s:option(Value, "recover_cooldown", "自愈冷却(秒)")
+recover_cooldown.datatype = "uinteger"
+recover_cooldown.default = "120"
+recover_cooldown.rmempty = false
+recover_cooldown.description = "两次自愈动作之间的最小间隔，避免频繁重连。"
+
+recover_wait = s:option(Value, "recover_wait", "自愈后等待(秒)")
+recover_wait.datatype = "uinteger"
+recover_wait.default = "8"
+recover_wait.rmempty = false
+recover_wait.description = "执行自愈动作后等待链路恢复的秒数，随后再重新检测联网。"
+
+recover_iface = s:option(Value, "recover_iface", "自愈接口(可选)")
+recover_iface.rmempty = true
+recover_iface.placeholder = "留空自动识别"
+recover_iface.description = "需要 renew/ifup 的逻辑接口名（如 wwan）。留空时按已识别设备自动匹配。自愈级别依次为 renew→ifup→ifdown+ifup→wifi reload。"
 
 history_title = s:option(DummyValue, "_history_title", "最近5次成功登录记录")
 function history_title.cfgvalue()

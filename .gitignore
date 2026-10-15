@@ -13,3 +13,6 @@ desktop.ini
 *.tmp
 *.bak
 *.log
+
+# 发行包目录（改用 GitHub Releases 分发）
+releases/

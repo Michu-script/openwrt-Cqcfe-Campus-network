@@ -31,11 +31,15 @@
 
 1. 每 `5` 秒执行一次 `ping cn.bing.com`
 2. 若 `ping` 成功，则认为外网正常，不做任何登录动作
-3. 若 `ping` 失败，调用 `/eportal/portal/online_list` 查询门户在线状态
-4. 若门户状态为未登录，调用 `/eportal/portal/login` 发起登录
-5. 登录后用在线状态接口复核，确认成功才记录
-6. 判定为**工作日**的静默时段（默认 `00:00-05:00`）内直接跳过全部检测；节假日、休息日不静默
-7. 连续失败按退避间隔重试（1→5s、2→15s、3→30s、4→60s、5→120s、≥6 封顶 `backoff_max`），达到失败上限后进入冷却
+3. 若 `ping` 失败，调用 `/eportal/portal/online_list` 查询门户在线状态（门户请求强制使用 IPv4）
+4. 门户可达性分三态：**在线** / **可达但未登录** / **不可达**
+5. 若门户可达但未登录，调用 `/eportal/portal/login` 发起登录，并用在线状态接口复核，确认成功才记录
+6. 若门户**不可达**，先归类失败原因（网关不可达 / 路由不可达 / DNS 解析失败 / 上游问题），连续不可达达到阈值（默认 `6` 次）后触发一次链路自愈
+7. 自愈按级别递进：`ubus renew` → `ifup` → `ifdown + ifup` → `wifi reload`；两次自愈之间有冷却时间，自愈成功后自动复位
+8. 判定为**工作日**的静默时段（默认 `00:00-05:00`）内直接跳过全部检测；节假日、休息日不静默
+9. 连续失败按退避间隔重试（1→5s、2→15s、3→30s、4→60s、5→120s、≥6 封顶 `backoff_max`），达到失败上限后进入冷却
+
+> 🩹 **链路自愈**用于解决「上行链路掉线导致必须重启路由器才能恢复」的故障：当门户持续不可达时，插件会主动按级别重连上行网络，无需人工重启。
 
 ### 认证体系特征
 
@@ -60,26 +64,24 @@ openwrt-Cqcfe-Campus-network/
 ├─ README.md
 ├─ LICENSE
 ├─ .gitattributes
-├─ package/
-│  └─ luci-app-campus-portal/
-│     ├─ Makefile
-│     ├─ README.md
-│     └─ root/
-└─ releases/
-   ├─ README.md
-   └─ v1.0.0/
-      ├─ luci-app-campus-portal_1.0.0-1_all.ipk
-      └─ luci-app-campus-portal_1.0.0-1_all.ipk.sha256
+├─ .gitignore
+└─ package/
+   └─ luci-app-campus-portal/
+      ├─ Makefile
+      ├─ README.md
+      └─ root/
 ```
+
+> 📦 已编译的 `ipk` 发行包不再放入仓库，统一通过 [GitHub Releases](https://github.com/huamili96-wq/openwrt-Cqcfe-Campus-network/releases) 分发。
 
 ## 🚀 使用方法
 
 ### 方式一：直接安装发行版（推荐）
 
-把 [releases/v1.0.0](./releases/v1.0.0) 里的 `ipk` 上传到路由器，然后执行：
+从 [GitHub Releases](https://github.com/huamili96-wq/openwrt-Cqcfe-Campus-network/releases) 下载 `luci-app-campus-portal_1.0.0-2_all.ipk`，上传到路由器，然后执行：
 
 ```sh
-opkg install luci-app-campus-portal_1.0.0-1_all.ipk
+opkg install luci-app-campus-portal_1.0.0-2_all.ipk
 /etc/init.d/campus_portal enable
 /etc/init.d/campus_portal start
 ```
@@ -87,7 +89,7 @@ opkg install luci-app-campus-portal_1.0.0-1_all.ipk
 安装前可先校验哈希：
 
 ```sh
-sha256sum luci-app-campus-portal_1.0.0-1_all.ipk
+sha256sum luci-app-campus-portal_1.0.0-2_all.ipk
 ```
 
 LuCI 菜单位置：
@@ -123,6 +125,11 @@ make package/luci-app-campus-portal/compile V=s
 | `max_retry` | `10` | 连续失败上限，达到后进入冷却 |
 | `retry_cooldown` | `1800` | 达到失败上限后的冷却时间（秒） |
 | `backoff_max` | `300` | 渐进退避的间隔上限（秒） |
+| `auto_recover` | `1` | 是否启用链路自愈（门户持续不可达时自动重连上行网络） |
+| `recover_after` | `6` | 连续检测到门户不可达多少次后触发一次自愈 |
+| `recover_cooldown` | `120` | 两次自愈动作之间的最小间隔（秒） |
+| `recover_wait` | `8` | 执行自愈动作后等待链路恢复的秒数 |
+| `recover_iface` | 空 | 需要 `renew`/`ifup` 的逻辑接口名（如 `wwan`），留空自动识别 |
 
 静默时段仅在判定当天为**工作日**时生效，判定优先级为：手动补班日列表 > 手动节假日列表 > 在线接口 > 周六/周日兜底。时段归属以「时段所属日期」为准（例如周二凌晨 `00:00-05:00` 属于周二；周五晚 12 点后属于周六，休息日不静默）。
 
@@ -131,10 +138,21 @@ make package/luci-app-campus-portal/compile V=s
 - 📶 当前登录状态
 - 🧪 最后一次联网检查
 - 🕒 最后动作与说明
+- 🩺 门户可达性与最近失败原因
+- 🔁 链路自愈状态（连续不可达次数 / 已自愈次数 / 下次自愈级别 / 自愈接口）
 - 🧭 自动识别接口与终端 IPv4 / MAC
 - 📝 最近 5 次成功登录记录
 - 📄 最近日志
 - 👤 账号 / 🔑 密码输入与保存
+
+## 🩹 更新记录
+
+### v1.0.0-2
+
+- 新增**链路自愈**：门户持续不可达时按级别自动重连上行网络（`renew` → `ifup` → `ifdown+ifup` → `wifi reload`），修复「掉线后必须重启路由器才能恢复」的问题
+- 门户可达性判定升级为三态，并新增失败原因归类（网关 / 路由 / DNS / 上游）
+- 门户与登录请求强制使用 IPv4，避免 IPv6 解析异常导致的假离线
+- LuCI 状态页新增门户可达性、最近失败原因、链路自愈状态展示；新增 5 个自愈相关配置项
 
 ## 🙏 致谢与开源项目
 
@@ -148,9 +166,9 @@ make package/luci-app-campus-portal/compile V=s
    - 仓库：https://github.com/xnxiang666/openwrt-sjzpt-Campus-network-tools
    - OpenWrt 打包方式与 LuCI 页面的实现思路参考自该项目
 
-## 📮 联系方式
+## 📮 反馈
 
-如有急事，可发送邮件至：**jasmeafwjd@gmail.com**
+如有问题或建议，欢迎在 [GitHub Issues](https://github.com/huamili96-wq/openwrt-Cqcfe-Campus-network/issues) 反馈。
 
 ## 📜 许可
 
